@@ -254,12 +254,13 @@ Cost: a cone is a few dozen multiplies, a handful of dot products and three reci
 
 **Measured on a PC**, over the 1,063,664 skinned vertices of that game's shipped character models in the bind pose, under two lights (a census program in the game's source tree): columns visited per vertex, every column 13.3; the sorted loop 5.2; the column lists 2.6. Four vertices in a hundred belong to a bone no column reaches. The list loop and the every-column loop agree within 0.000063 of strength, which moves a packed 8-bit colour by one step on about one vertex in 75,000.
 
-**Estimate**, from an SH-4 instruction model fitted to the one hardware number and not yet measured: the sorted loop at about half of the 14.70 ms, the column lists at about a fifth. Memory stalls on the vertex stream are not in the model, so expect the hardware figure above the model's; a reviewer's reading is 3.5 to 4.5 ms for that scene.
+**Measured again on the Dreamcast after the column lists and the one-FTRV-per-vertex loop**, the same scene, the same six characters, 84 columns and 5406 vertices: **4.5 ms**, down from 14.70 ms. That is 3.3 times faster: about 0.83 us, or roughly 166 SH-4 cycles at 200 MHz, per vertex (544 before).
 
-<!-- PLACEHOLDER: after the next hardware build, the same scene measured again. Fill in and delete the estimate above.
-| Scene                        | Columns | Vertices | Before   | After |
+| Scene                        | Columns | Vertices | Before   | After  |
 | --- | --- | --- | --- | --- |
-| six characters, 33 ms frame  | 84      | 5406     | 14.70 ms |       | -->
+| six characters, 33 ms frame  | 84      | 5406     | 14.70 ms | 4.5 ms |
+
+The 4.5 ms is one hardware run of that scene as the game's author timed it, not a benchmark suite. It includes everything the sorting, the column lists and the SH4ZAM routines changed together, not one trick alone.
 
 Why it is cheap: the CPU already holds every vertex to transform it (the SH-4 has no vertex shader). The shade is a few dot products on that vertex, and the colour write it was already going to do. Nothing extra is drawn or stored. The soft edge is a fade, so it costs the same as a hard one.
 
