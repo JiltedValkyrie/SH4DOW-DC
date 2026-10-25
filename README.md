@@ -2,7 +2,9 @@
 
 Soft self-shadow for skinned characters, computed per vertex on the CPU. Each limb casts a soft column away from the light; a vertex inside a column gets darker. No shadow map, no second mesh, no extra draw, no video memory.
 
-Two files. C99. Made for the Sega Dreamcast (SH-4) with [SH4ZAM](https://github.com/gyrovorbis/sh4zam); builds in plain C anywhere else.
+And the floor half, **foot cones**: two small shadows per character, one under each foot, each a cone that starts at the heel and stretches away from the light. The library works out the quad, its picture and its fade; you draw the quad.
+
+Three files, C99. Made for the Sega Dreamcast (SH-4) with [SH4ZAM](https://github.com/gyrovorbis/sh4zam) 0.10; builds in plain C anywhere else.
 
 Originally developed for Halo: Dreamcast Evolved.
 
@@ -13,6 +15,7 @@ Originally developed for Halo: Dreamcast Evolved.
 - [How it works](#how-it-works)
 - [API](#api)
 - [Tuning](#tuning)
+- [Foot cones](#foot-cones)
 - [Cost](#cost)
 - [Build and test](#build-and-test)
 - [Credits and license](#credits-and-license)
@@ -27,7 +30,7 @@ A dark band under the chin, the arm's shade across the chest, the chest's shade 
 
 ## Quick start
 
-Add `include/` to your include path and `src/sh4dow_dc.c` to your build. On the Dreamcast, SH4ZAM must be on the include path too. Anywhere else, define `SH4DOW_DC_NO_SH4ZAM`.
+Add `include/` to your include path and `src/sh4dow_dc.c` to your build (`src/sh4dow_foot.c` too if you want the foot cones). On the Dreamcast, SH4ZAM must be on the include path too. Anywhere else, define `SH4DOW_DC_NO_SH4ZAM`.
 
 ```c
 #include <stdio.h>
@@ -87,7 +90,7 @@ Everything is in `include/sh4dow_dc.h`. The per-vertex functions are `static inl
 | `sh4dow_prepare` | per character, per frame | builds the frame: the columns, sorted by start, and the fast-path tables. Returns the column count; 0 means nothing to shade |
 | `sh4dow_shade` | per vertex batch | multiplies float rgb triples by the shade. Byte strides; `bone0` NULL turns the own-bone skip off |
 | `sh4dow_axes`, `sh4dow_strength` | per vertex | the strength 0..1 of one vertex against every column, for your own colour math |
-| `sh4dow_project` | per ball, per vertex | a point onto the frame's axes, origin-relative. On the Dreamcast, `frame->rows` in XMTRX does the same with one FTRV |
+| `sh4dow_project` | per ball, per vertex | a point onto the frame's axes, origin-relative. On the Dreamcast, `sh4dow_load_xmtrx` once per frame and one FTRV per point does the same |
 | `sh4dow_ball_columns` | per bone, per frame | the columns a ball can touch, at most `frame->count` bytes |
 | `sh4dow_capsule_columns` | per bone pair, per frame | the same for the hull of two balls (a blended vertex) |
 | `sh4dow_strength_list` | per vertex | the strength from the projection, against a list |
@@ -145,6 +148,106 @@ Budgets the library leaves to you: how many limbs cast (the original game spends
 
 Symptoms: the shade falls toward the light, flip `direction`. The whole character darkens, `outer_scale` times your radii is bigger than the body. Nothing darkens, the direction is flipped, the radii are in another unit than the vertices, or joints and vertices are in different spaces.
 
+## Foot cones
+
+Two small floor shadows per character, one under each foot. Each is a cone: a round heel that widens away from the light and fades out, long when the light is low and short when it is overhead. It needs no column frame and no vertices; it is a quad, a picture and a fade.
+
+Add `src/sh4dow_foot.c`. The same example, `example/feet.c`, builds and runs in `make test`; the test suite checks that it matches this page. It prints the two cones' quads, each fading to 0.89 because the heel is 0.04 above the floor, and a distance fade:
+
+```c
+#include <stdio.h>
+#include "sh4dow_dc.h"
+
+int main(void) {
+    /* A skeleton's bind pose node spheres, model space, Z up, +Y left: pelvis, left foot, right foot. Height 0 to 1. */
+    const float node[3][3] = { { 0.0f, 0.0f, 0.50f }, { 0.0f, 0.10f, 0.04f }, { 0.0f, -0.10f, 0.04f } };
+    const float node_radius[3] = { 0.12f, 0.05f, 0.05f };
+    const float up[3] = { 0.0f, 0.0f, 1.0f }, forward[3] = { 1.0f, 0.0f, 0.0f };
+    const float floor_point[3] = { 0.0f, 0.0f, 0.0f };      /* a flat floor under the character ... */
+    const float light[3] = { 1.0f, 0.0f, -1.0f };           /* ... and the brightest light's travel: 45 degrees */
+    uint8_t feet[2], texture[32 * 32];
+    unsigned i, found = sh4dow_pick_feet(&node[0][0], node_radius, 3, 2, 1, 0.0f, 1.0f, feet);   /* once per model */
+
+    sh4dow_foot_texture(texture, 32);                       /* once, then upload it as your shadow texture */
+    for(i = 0; i < found; i++) {                            /* per character per frame */
+        sh4dow_foot_t foot;
+        float quad[4][3], fade;
+
+        sh4dow_foot_place(&foot, NULL, node[feet[i]], node_radius[feet[i]], forward, up);   /* from the posed foot sphere */
+        foot.away[0] = light[0]; foot.away[1] = light[1]; foot.away[2] = light[2];
+        fade = sh4dow_foot_cone(&foot, NULL, floor_point, up, up, forward, quad);
+        if(fade > 0.0f)                                     /* 0: a wall, or the foot is in the air: no quad */
+            printf("foot %u fade %.2f  TL (%.3f, %.3f)  BR (%.3f, %.3f)\n", feet[i], fade, quad[0][0], quad[0][1], quad[3][0], quad[3][1]);
+    }
+    printf("camera 12: %.2f  19: %.2f  21: %.2f\n", sh4dow_foot_range_fade(NULL, 12.0f, 1.0f),
+           sh4dow_foot_range_fade(NULL, 19.0f, 1.0f), sh4dow_foot_range_fade(NULL, 21.0f, 1.0f));
+    return 0;
+}
+```
+
+What you pass in and what you draw:
+
+- **Feet.** Once per model, from its bind pose node spheres: `sh4dow_pick_feet` finds the lowest node and the lowest one on the other side of the middle, and only below the lowest quarter of the model's height (a hovering or legless model has none). You say which axis is up and which is left-right.
+- **Place.** Each frame, `sh4dow_foot_place` turns a posed foot sphere into a `sh4dow_foot_t`: the heel is 0.7 sphere radii behind the centre along the character's facing (height kept), the half width 0.8 of the radius, clamped to 3 to 12 cm. Set `foot.away` yourself: the light's travel at the foot, from the light toward it. Use your brightest light near the character, or straight down when there is none.
+- **Cone.** `sh4dow_foot_cone` puts the cone on the floor plane under the foot (a point and a normal, from your collision), as a quad: TL and TR at the heel, BL and BR at the far end, texture u across and v along. It returns the fade: 1 with the heel on the floor, 0 at 0.35 above it, so a jumping character's shadow melts away. It returns 0 for a wall, a ceiling, a plane a storey above, or a foot with no radius. The cone's length is 3 foot radii with the light overhead and grows by 3 radii for each unit of the light's slope, to 9 radii.
+- **Picture.** `sh4dow_foot_texture` fills a one byte per texel picture, `sh4dow_foot_texture565` the same as grey RGB565 (what the Dreamcast game uploads: 32 x 32 is plenty). Make it once.
+- **Distance.** `sh4dow_foot_range_fade` is 1 up to 18 from the camera, 0 at 20, smooth between, with a scope's magnification as `zoom`. How many characters get cones, and the choice of light, are yours.
+- **Draw.** A multiply: the floor keeps `1 - texel * strength` of its light. Draw the quad over the floor, a little above it (the cone is already lifted 0.012), with the picture as the texture and a vertex colour of grey `strength` (your darkness times the cone's fade times the distance fade), blended `dst * (1 - src)` (zero / inverse source colour). No depth write.
+
+Units. The distances are in the original game's world units: 1 unit is 3.048 m and a standing character is about 0.7 tall. If yours differ, carry them over once: `sh4dow_foot_params_default(&p); sh4dow_foot_params_scale(&p, 3.048f);` for metres. The radii, slopes and the picture are ratios and do not change. Z up or Y up does not matter: you pass `up`.
+
+| Function | When | What |
+| --- | --- | --- |
+| `sh4dow_foot_params_default`, `sh4dow_foot_params_scale` | once | the shipped tuning (the table below), and the six distances in another unit |
+| `sh4dow_pick_feet` | per model | the two foot nodes of a bind pose |
+| `sh4dow_foot_place` | per foot, per frame | the heel and half width from a posed foot sphere |
+| `sh4dow_foot_cone` | per foot, per frame | the cone as a quad on a floor plane, and its fade |
+| `sh4dow_foot_range_fade` | per character | the fade with distance from the camera |
+| `sh4dow_foot_texel`, `sh4dow_foot_texture`, `sh4dow_foot_texture565` | once | the picture, one point or a whole texture |
+
+`NULL` for `params` is the shipped tuning. Everything here is plain arithmetic: no allocation, no globals.
+
+The foot tuning. Lengths and widths are in foot radii; the distances are in the units above.
+
+| Macro | Default | Unit | Means | Raise it | Lower it |
+| --- | --- | --- | --- | --- | --- |
+| SH4DOW_FOOT_MIN_LEN | 3.0 | radii | cone length with the light overhead | longer stub | shorter, rounder |
+| SH4DOW_FOOT_GAIN | 3.0 | radii per slope | extra length per unit of the light's slope (across the floor over into it) | low light stretches more | the length changes less with the light |
+| SH4DOW_FOOT_MAX_SLOPE | 2.0 | slope | where the length stops growing (9 radii) | longer streaks near the horizon | capped sooner |
+| SH4DOW_FOOT_MIN_FACING | 0.25 | normal . up | the floor normal must point up more than this | steeper floors take a cone | only flat floors |
+| SH4DOW_FOOT_HEEL_BACK | 0.7 | sphere radii | the heel's distance behind the foot sphere's centre | starts further back | starts nearer the toe |
+| SH4DOW_FOOT_WIDTH | 0.8 | sphere radii | half width at the heel | fatter | thinner |
+| SH4DOW_FOOT_WIDTH_MIN | 0.03 | distance | smallest half width | small feet keep a visible cone | |
+| SH4DOW_FOOT_WIDTH_MAX | 0.12 | distance | largest half width | | big feet stay neat |
+| SH4DOW_FOOT_FADE_HEIGHT | 0.35 | distance | heel height above the floor where the cone is gone | a jumper keeps its shadow longer | gone sooner |
+| SH4DOW_FOOT_LIFT | 0.012 | distance | the quad's offset off the floor | no flicker on a rough floor | closer to the floor |
+| SH4DOW_FOOT_RANGE | 20.0 | distance | camera distance where the cone is gone | farther cones | nearer |
+| SH4DOW_FOOT_RANGE_FADE | 2.0 | distance | the fade out spans this much before the range | softer | a sharper edge |
+| SH4DOW_FOOT_APEX | 0.25 | fraction of the cone | where the picture's round heel sits | | |
+| SH4DOW_FOOT_ZONE | 0.25 | fraction of the height | feet lie in this lowest part of the model | | |
+
+The header's macros are the source of truth; the test suite checks this table against them. The prototypes, as the header declares them (the test suite compiles this block against the header):
+
+```c
+#include "sh4dow_dc.h"
+
+void sh4dow_foot_params_default(sh4dow_foot_params_t *params);
+void sh4dow_foot_params_scale(sh4dow_foot_params_t *params, float units_per_unit);
+void sh4dow_foot_place(sh4dow_foot_t *foot, const sh4dow_foot_params_t *params, const float centre[3],
+                       float sphere_radius, const float forward[3], const float up[3]);
+float sh4dow_foot_cone(const sh4dow_foot_t *foot, const sh4dow_foot_params_t *params,
+                       const float floor_point[3], const float floor_normal[3],
+                       const float up[3], const float forward[3], float quad[4][3]);
+float sh4dow_foot_range_fade(const sh4dow_foot_params_t *params, float dist, float zoom);
+float sh4dow_foot_texel(float u, float v);
+void sh4dow_foot_texture(uint8_t *out, unsigned side);
+void sh4dow_foot_texture565(uint16_t *out, unsigned side);
+unsigned sh4dow_pick_feet(const float *centre, const float *radius, unsigned count,
+                          unsigned up_axis, unsigned side_axis, float lo, float hi, uint8_t out[2]);
+```
+
+Cost: a cone is a few dozen multiplies, a handful of dot products and three reciprocals, once per foot per frame; the picture is made once. Not yet measured on hardware.
+
 ## Cost
 
 **Measured on the Dreamcast** by the original game (one cutscene, six characters, 84 columns, 5406 vertices, 33 ms frame): **14.70 ms** for the shade, with the every-column loop before it was sorted. That is 2.72 us, or 544 SH-4 cycles, per vertex.
@@ -163,13 +266,16 @@ Why it is cheap: the CPU already holds every vertex to transform it (the SH-4 ha
 ## Build and test
 
 ```sh
-make test                        # host, plain C: test/shade_test, example/example, example/quickstart
-make dc SH4ZAM=/path/to/sh4zam   # Dreamcast: build/libsh4dow_dc.a (KallistiOS environment sourced)
+make test                        # host, plain C: test/shade_test, test/foot_test, example/example, example/quickstart, example/feet
+make test-shz SH4ZAM=/path/to/sh4zam   # host, the SH4ZAM path on SH4ZAM's software back-end: the same two tests
+make dc SH4ZAM=/path/to/sh4zam   # Dreamcast: build/libsh4dow_dc.a, both objects (KallistiOS environment sourced)
 ```
 
-The Dreamcast build wants SH4ZAM's include path and the flags its fast paths expect: `-ffast-math -ffp-contract=fast -mfsrra -mfsca -fno-math-errno`. Link SH4ZAM's library as you already do. The library needs no KallistiOS header.
+The Dreamcast build wants SH4ZAM's include path and the flags its fast paths expect: `-ffast-math -ffp-contract=fast -mfsrra -mfsca -fno-math-errno`. Link SH4ZAM's library as you already do, and do not copy SH4ZAM's files into your project: use it as a library, at 0.10 or later. The library needs no KallistiOS header.
 
 `test/shade_test.c`: one column's core, feather, fade-out, lit side and own-bone skip; a grid and random 14-limb frames against the plain formula with no early-outs; ball lists and capsule lists against the every-column loop, with a shrunk ball and a shrunk capsule that must be caught; a figure under a straight-down and a leaning light: the shade falls away from the light, the chin stays lit, a mirrored figure mirrors.
+
+`test/foot_test.c`: the shipped numbers; the cone on a flat floor under a 45 degree light, an overhead one, a horizon one and no light at all; the walls, ceilings and storeys it refuses; the fade as the heel rises; a sloped floor, a Y up world and another unit giving the same cone; the placement and its clamps; the distance fade with a scope; the picture (full at the heel, empty at the far end, mirror symmetric, one texel at a time against the byte and RGB565 textures); the foot finder on Z up and Y up skeletons, one foot, two feet on one side, hovering. Both tests run on the plain C path and on the SH4ZAM path.
 
 ## Credits and license
 

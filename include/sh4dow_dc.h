@@ -24,6 +24,13 @@
     Both return the same strength. sh4dow_shade() runs the first over float
     colour triples. Multiply the lit colour by 1 - dark * strength.
 
+    Foot cones (src/sh4dow_foot.c) are the floor half: two small shadows per
+    character, one under each foot, each a cone that starts at the heel and
+    stretches away from the brightest light. sh4dow_foot_place() sets a cone
+    from a posed foot sphere, sh4dow_foot_cone() puts it on a floor plane as a
+    quad, sh4dow_foot_texture() draws the picture it carries and
+    sh4dow_foot_range_fade() fades it with distance. They need no column frame.
+
     The dot products, square roots and reciprocals are SH4ZAM. Define
     SH4DOW_DC_NO_SH4ZAM to build the same steps in plain C.
 
@@ -210,6 +217,169 @@ void sh4dow_shade(const sh4dow_frame_t *frame,
                   float *rgb, size_t rgb_stride,
                   unsigned count);
 
+/** \name Foot cones: shipped tuning (sh4dow_foot_params_default())
+    Lengths and widths are in foot radii (a pure ratio). The distances are in
+    the original game's world units (1 unit = 3.048 m, a standing character is
+    about 0.7 units tall): if yours differ, sh4dow_foot_params_scale() carries
+    them over.
+    @{ */
+#define SH4DOW_FOOT_MIN_LEN     3.0f    /**< \brief Cone length with the light overhead, in radii. */
+#define SH4DOW_FOOT_GAIN        3.0f    /**< \brief Extra radii of length per unit of light slope. */
+#define SH4DOW_FOOT_MAX_SLOPE   2.0f    /**< \brief Slope (across / down) where the cone stops growing: 9 radii. */
+#define SH4DOW_FOOT_MIN_FACING  0.25f   /**< \brief Floor normal . up at or below which no cone (a wall). */
+#define SH4DOW_FOOT_HEEL_BACK   0.7f    /**< \brief Heel: foot sphere radii behind its centre, along the facing. */
+#define SH4DOW_FOOT_WIDTH       0.8f    /**< \brief Cone half width at the heel, in foot sphere radii ... */
+#define SH4DOW_FOOT_WIDTH_MIN   0.03f   /**< \brief ... clamped to at least this (distance) ... */
+#define SH4DOW_FOOT_WIDTH_MAX   0.12f   /**< \brief ... and at most this (distance). */
+#define SH4DOW_FOOT_FADE_HEIGHT 0.35f   /**< \brief Heel height above the floor where the cone is gone (distance). */
+#define SH4DOW_FOOT_LIFT        0.012f  /**< \brief The quad's offset off the floor, against depth fighting (distance). */
+#define SH4DOW_FOOT_RANGE       20.0f   /**< \brief Camera distance where the cone is gone (distance). */
+#define SH4DOW_FOOT_RANGE_FADE  2.0f    /**< \brief The fade out spans this much before the range (distance). */
+#define SH4DOW_FOOT_APEX        0.25f   /**< \brief The picture's round heel sits this fraction of the cone along. */
+#define SH4DOW_FOOT_ZONE        0.25f   /**< \brief sh4dow_pick_feet(): feet lie in this lowest fraction of the height. */
+/** @} */
+
+#define SH4DOW_NO_FOOT 0xffu            /**< \brief sh4dow_pick_feet(): no foot found. */
+
+/** \brief   One foot's cone. */
+typedef struct sh4dow_foot {
+    float heel[3];              /**< \brief Where the cone starts: its narrow end. */
+    float away[3];              /**< \brief The light's travel at the foot, from the light toward the heel; any length. */
+    float radius;               /**< \brief Half width at the heel, in distance units; <= 0 casts nothing. */
+} sh4dow_foot_t;
+
+/** \brief   Foot cone shape: the Foot cones macros, as fields. */
+typedef struct sh4dow_foot_params {
+    float min_len;              /**< \brief Length with the light overhead, in radii. */
+    float gain;                 /**< \brief Extra radii per unit of slope. */
+    float max_slope;            /**< \brief Slope where the length stops growing. */
+    float min_facing;           /**< \brief Floor normal . up must be above this. */
+    float heel_back;            /**< \brief sh4dow_foot_place(): heel, in sphere radii behind the centre. */
+    float width;                /**< \brief sh4dow_foot_place(): half width, in sphere radii. */
+    float fade_height;          /**< \brief Heel height where the cone is gone, distance, > 0. */
+    float lift;                 /**< \brief Offset off the floor, distance. */
+    float width_min;            /**< \brief sh4dow_foot_place(): smallest half width, distance. */
+    float width_max;            /**< \brief sh4dow_foot_place(): largest half width, distance. */
+    float range;                /**< \brief sh4dow_foot_range_fade(): where it reaches 0, distance. */
+    float range_fade;           /**< \brief sh4dow_foot_range_fade(): width of the fade, distance. */
+} sh4dow_foot_params_t;
+
+/** \brief   Fill params with the shipped foot cone tuning.
+    \param  params          The parameters to fill.
+*/
+void sh4dow_foot_params_default(sh4dow_foot_params_t *params);
+
+/** \brief   Carry the distances over to another unit.
+
+    Multiplies fade_height, lift, width_min, width_max, range and range_fade;
+    the radius ratios and the slope numbers are unit free and stay.
+
+    \param  params          The parameters to scale, normally sh4dow_foot_params_default().
+    \param  units_per_unit  Your units per original game unit: 3.048 for metres,
+                            1 for none.
+*/
+void sh4dow_foot_params_scale(sh4dow_foot_params_t *params, float units_per_unit);
+
+/** \brief   Place a foot's cone from its posed foot sphere.
+
+    The heel is heel_back sphere radii behind the centre, along forward
+    flattened across up (the height is kept); the half width is width sphere
+    radii, clamped to width_min .. width_max. away is left alone: set it from
+    your light.
+
+    \param  foot            The foot to fill: heel and radius.
+    \param  params          The shape, or NULL for the shipped tuning.
+    \param  centre          The foot sphere's centre, posed, world space.
+    \param  sphere_radius   Its radius, world units, character scale applied.
+    \param  forward         The character's facing, any length.
+    \param  up              World up, unit length.
+*/
+void sh4dow_foot_place(sh4dow_foot_t *foot, const sh4dow_foot_params_t *params,
+                       const float centre[3], float sphere_radius,
+                       const float forward[3], const float up[3]);
+
+/** \brief   One foot's cone on a floor plane, as a quad.
+
+    The heel drops onto the plane along its normal, and the quad runs from
+    there away from the light only, along away flattened onto the plane. Its
+    length grows with the light's slope (across the floor over into it), from
+    min_len to min_len + gain * max_slope radii. With the light straight
+    overhead it points along forward and has the shortest length.
+
+    The quad is TL, TR, BL, BR: TL and TR at the heel (texture v 0), BL and BR
+    at the far end (v 1); TL and BL are texture u 0, TR and BR u 1. The picture
+    is mirror symmetric, so which side is which does not show.
+
+    \param  foot            The foot.
+    \param  params          The shape, or NULL for the shipped tuning.
+    \param  floor_point     A point of the floor plane under the foot.
+    \param  floor_normal    The plane's normal, facing the foot; any length.
+    \param  up              World up, unit length.
+    \param  forward         The character's facing, for a light straight overhead.
+    \param  quad            The four corners, out.
+    \return                 The fade, 1 with the heel on the floor down to 0 at
+                            fade_height above it; 0 when there is no quad (a
+                            wall, no radius, the heel too high, or the plane
+                            more than fade_height above the heel).
+*/
+float sh4dow_foot_cone(const sh4dow_foot_t *foot, const sh4dow_foot_params_t *params,
+                       const float floor_point[3], const float floor_normal[3],
+                       const float up[3], const float forward[3], float quad[4][3]);
+
+/** \brief   Fade with distance from the camera.
+
+    Full to range - range_fade, nothing from range on; both scaled by zoom (a
+    scope's magnification), which counts as 1 below 1.
+
+    \param  params          The shape, or NULL for the shipped tuning.
+    \param  dist            Distance from the camera, finite.
+    \param  zoom            Magnification, 1 for none.
+    \return                 0..1.
+*/
+float sh4dow_foot_range_fade(const sh4dow_foot_params_t *params, float dist, float zoom);
+
+/** \brief   The foot cone picture at one point.
+
+    A round heel at v = 2 * SH4DOW_FOOT_APEX (in half widths), the cone
+    widening past it to the full width and fading toward a third, then out at
+    the far end.
+
+    \param  u               Across, 0..1.
+    \param  v               Along, 0 at the heel end of the quad, 1 at the far end.
+    \return                 Shadow, 0..1.
+*/
+float sh4dow_foot_texel(float u, float v);
+
+/** \brief   The foot cone picture, one byte a texel (texel centres).
+    \param  out             side * side bytes, row major, row 0 at v 0; 255 is full shadow.
+    \param  side            Texels a side; 32 is plenty.
+*/
+void sh4dow_foot_texture(uint8_t *out, unsigned side);
+
+/** \brief   The foot cone picture as grey RGB565, for a texture the GPU multiplies in.
+    \param  out             side * side texels, row major, row 0 at v 0; 0xffff is full shadow.
+    \param  side            Texels a side; 32 is plenty.
+*/
+void sh4dow_foot_texture565(uint16_t *out, unsigned side);
+
+/** \brief   Find a skeleton's two feet from its bind pose node spheres.
+
+    The lowest node, then the lowest on the other side of the middle (the
+    other sign along side_axis). A node counts only below SH4DOW_FOOT_ZONE of
+    the height lo..hi, so a hovering or legless model has none.
+
+    \param  centre          Node sphere centres, x y z per node, model space.
+    \param  radius          Node sphere radii; <= 0 is never a foot.
+    \param  count           Nodes; past 254 are ignored.
+    \param  up_axis         The up axis: 0 x, 1 y, 2 z.
+    \param  side_axis       The left-right axis.
+    \param  lo, hi          The model's extent along up.
+    \param  out             Node indices, SH4DOW_NO_FOOT for none.
+    \return                 Feet found, 0..2.
+*/
+unsigned sh4dow_pick_feet(const float *centre, const float *radius, unsigned count,
+                          unsigned up_axis, unsigned side_axis, float lo, float hi, uint8_t out[2]);
+
 /* Private: the arithmetic both builds share. */
 #ifndef SH4DOW_DC_NO_SH4ZAM
 static inline float sh4dow_sqrt_(float x) { return shz_sqrtf(x); }
@@ -220,10 +390,12 @@ static inline float sh4dow_smooth01(float t) {
     return t * t * shz_fmaf(t, -2.0f, 3.0f);
 }
 
-/* perp^2 - outer^2 by one FIPR. */
+/* perp^2 - outer^2 by one four-term dot (FMACs; FIPR with SHZ_SH4_DOT_FIPR). */
 static inline float sh4dow_disc_(const sh4dow_disc_t *d, float vu, float vw, float vv) {
     return shz_dot8f(d->c[0], d->c[1], d->c[2], d->c[3], vu, vw, vv, 1.0f);
 }
+
+static inline float sh4dow_len2_(float a, float b) { return shz_vec2_magnitude_sqr(shz_vec2_init(a, b)); }
 #else
 static inline float sh4dow_sqrt_(float x) { return sqrtf(x); }
 static inline float sh4dow_sat_(float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; }
@@ -239,6 +411,8 @@ static inline float sh4dow_smooth01(float t) {
 static inline float sh4dow_disc_(const sh4dow_disc_t *d, float vu, float vw, float vv) {
     return d->c[0] * vu + d->c[1] * vw + d->c[2] * vv + d->c[3];
 }
+
+static inline float sh4dow_len2_(float a, float b) { return a * a + b * b; }
 #endif
 
 /* Strength across the feather, from the squared distance to the axis. */
@@ -277,18 +451,48 @@ static inline sh4dow_axes_t sh4dow_axes(const sh4dow_frame_t *frame) {
 /** \brief   Project a point onto a frame, origin-relative.
 
     This is what sh4dow_strength_list() and sh4dow_ball_columns() take. On the
-    Dreamcast, frame->rows loaded into XMTRX does it in one FTRV.
+    Dreamcast, sh4dow_load_xmtrx() then one FTRV per point does the same.
 
     \param  frame           A prepared frame.
     \param  x, y, z         The point.
     \param  out             Light axis, u and w coordinates.
 */
 static inline void sh4dow_project(const sh4dow_frame_t *frame, float x, float y, float z, float out[3]) {
+#ifndef SH4DOW_DC_NO_SH4ZAM
+    const shz_vec3_t r = shz_vec4_dot3(shz_vec4_init(x, y, z, 1.0f),
+        shz_vec4_init(frame->rows[0][0], frame->rows[0][1], frame->rows[0][2], frame->rows[0][3]),
+        shz_vec4_init(frame->rows[1][0], frame->rows[1][1], frame->rows[1][2], frame->rows[1][3]),
+        shz_vec4_init(frame->rows[2][0], frame->rows[2][1], frame->rows[2][2], frame->rows[2][3]));
+
+    out[0] = r.x;
+    out[1] = r.y;
+    out[2] = r.z;
+#else
     int k;
 
     for(k = 0; k < 3; k++)
         out[k] = frame->rows[k][0] * x + frame->rows[k][1] * y + frame->rows[k][2] * z + frame->rows[k][3];
+#endif
 }
+
+#ifndef SH4DOW_DC_NO_SH4ZAM
+/** \brief   Load a frame's projection into XMTRX (SH4ZAM builds only).
+
+    After it, shz_xmtrx_transform_point3(shz_vec3_init(x, y, z)) is
+    sh4dow_project() in one FTRV: (vt, vu, vw) for sh4dow_strength_list() and
+    sh4dow_strength_rel(). XMTRX keeps the frame until you load your own
+    matrix again.
+
+    \param  frame           A prepared frame.
+*/
+static inline void sh4dow_load_xmtrx(const sh4dow_frame_t *frame) {
+    const shz_vec4_t r0 = shz_vec4_init(frame->rows[0][0], frame->rows[0][1], frame->rows[0][2], frame->rows[0][3]);
+    const shz_vec4_t r1 = shz_vec4_init(frame->rows[1][0], frame->rows[1][1], frame->rows[1][2], frame->rows[1][3]);
+    const shz_vec4_t r2 = shz_vec4_init(frame->rows[2][0], frame->rows[2][1], frame->rows[2][2], frame->rows[2][3]);
+
+    shz_xmtrx_load_rows_3x4(&r0, &r1, &r2);
+}
+#endif
 
 /** \brief   Shade strength at a vertex, against every column.
 
@@ -337,7 +541,7 @@ static inline float sh4dow_strength(const sh4dow_frame_t *frame, const sh4dow_ax
             continue;
         du = vu - col->lu;
         dw = vw - col->lw;
-        perp2 = du * du + dw * dw;
+        perp2 = sh4dow_len2_(du, dw);
         if(perp2 >= col->outer2)
             continue;
         s = perp2 <= col->inner2 ? 1.0f : sh4dow_feather_(perp2, col->inner, col->inv_feather);
@@ -362,7 +566,7 @@ static inline float sh4dow_strength(const sh4dow_frame_t *frame, const sh4dow_ax
 */
 static inline float sh4dow_strength_rel(const sh4dow_frame_t *frame, float vt, float vu, float vw,
                                         unsigned own) {
-    const float vv = vu * vu + vw * vw;
+    const float vv = sh4dow_len2_(vu, vw);
     float dark = 0.0f;
     int j;
 
@@ -394,8 +598,8 @@ static inline float sh4dow_strength_rel(const sh4dow_frame_t *frame, float vt, f
 
 /** \brief   Shade strength at a projected vertex, against a column list.
 
-    One FIPR and one compare per listed column. A FULL entry skips the fades,
-    and one that lands in the solid core ends the search.
+    One four-term dot product and one compare per listed column. A FULL entry
+    skips the fades, and one that lands in the solid core ends the search.
 
     \note
     The disc test expands the square, so it loses precision for a column much
@@ -410,7 +614,7 @@ static inline float sh4dow_strength_rel(const sh4dow_frame_t *frame, float vt, f
 */
 static inline float sh4dow_strength_list(const sh4dow_frame_t *frame, float vt, float vu, float vw,
                                          const uint8_t *list, unsigned n) {
-    const float vv = vu * vu + vw * vw;
+    const float vv = sh4dow_len2_(vu, vw);
     float dark = 0.0f;
     unsigned k;
 

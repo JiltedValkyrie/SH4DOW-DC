@@ -13,7 +13,12 @@
 #include <stdio.h>
 #include "../include/sh4dow_dc.h"
 
-#define TOL  0.0002f            /* strength: float rounding of two formulations */
+/* strength: float rounding of two formulations. The list loop expands the disc test's square, so on random columns far thinner than their distance from the
+   frame's origin it can differ by a little more (the README's note): -DSH4DOW_TEST_TOL=... widens it for a build whose rounding differs. */
+#ifndef SH4DOW_TEST_TOL
+#define SH4DOW_TEST_TOL 0.0002f
+#endif
+#define TOL  SH4DOW_TEST_TOL
 
 static int fail(const char *msg) {
     fprintf(stderr, "FAIL %s\n", msg);
@@ -416,11 +421,85 @@ static int direction(void) {
     return 0;
 }
 
+/* sh4dow_project() is the point on the frame's three axes less the origin; on the SH4ZAM path sh4dow_load_xmtrx() and one transform give the same numbers. */
+static int projection(void) {
+    const sh4dow_limb_t limb[3] = {
+        { { 0.3f, -0.2f, 1.7f }, 0.10f, 12, SH4DOW_LIMB_HEAD },
+        { { 0.2f, -0.1f, 1.5f }, 0.06f, 9, SH4DOW_LIMB_NECK },
+        { { 0.1f, 0.3f, 1.3f }, 0.18f, 6, 0 },
+    };
+    const float dir[3] = { 0.3f, -0.4f, -0.9f };
+    sh4dow_frame_t f;
+    unsigned i;
+
+    if(sh4dow_prepare(&f, NULL, limb, 3, dir) != 3)
+        return fail("projection prepare");
+#ifndef SH4DOW_DC_NO_SH4ZAM
+    sh4dow_load_xmtrx(&f);
+#endif
+    for(i = 0; i < 200; i++) {
+        const float p[3] = { -2.0f + 0.021f * (float)i, 1.0f - 0.017f * (float)i, 0.5f + 0.011f * (float)i };
+        float q[3], want[3];
+        int k;
+
+        sh4dow_project(&f, p[0], p[1], p[2], q);
+        want[0] = p[0] * f.dir[0] + p[1] * f.dir[1] + p[2] * f.dir[2] - f.ot;
+        want[1] = p[0] * f.u[0] + p[1] * f.u[1] + p[2] * f.u[2] - f.ou;
+        want[2] = p[0] * f.w[0] + p[1] * f.w[1] + p[2] * f.w[2] - f.ow;
+        for(k = 0; k < 3; k++)
+            if(!near(q[k], want[k], 1.0e-5f))
+                return fail("sh4dow_project against the axes");
+#ifndef SH4DOW_DC_NO_SH4ZAM
+        {
+            const shz_vec3_t x = shz_xmtrx_transform_point3(shz_vec3_init(p[0], p[1], p[2]));
+
+            if(!near(x.x, q[0], 1.0e-5f) || !near(x.y, q[1], 1.0e-5f) || !near(x.z, q[2], 1.0e-5f))
+                return fail("XMTRX against sh4dow_project");
+        }
+#endif
+    }
+    /* The side axes for lights along the axes, on the diagonals (ties between the world axes) and near one: cross(light, the world axis least aligned with it),
+       then the light crossed with that. */
+    {
+        static const float ds[][3] = { { 0, 0, -1 }, { 0, 0, 1 }, { 1, 0, 0 }, { 0, -1, 0 }, { 1, 1, 1 }, { -1, -1, 1 }, { 1, 1, 0 }, { 0, 1, 1 }, { 1, 0, 1 },
+                                       { 0.5f, 0.5f, 0.7071f }, { 3, -3, 3 }, { 0.001f, 0.002f, -1 }, { 0.4f, 0.1f, -0.2f } };
+        unsigned d;
+
+        for(d = 0; d < sizeof(ds) / sizeof(ds[0]); d++) {
+            float x = ds[d][0], y = ds[d][1], z = ds[d][2], len = sqrtf(x * x + y * y + z * z), h[3] = { 0, 0, 0 }, c[3], cl, wx, wy, wz;
+
+            x /= len; y /= len; z /= len;
+            if(fabsf(x) <= fabsf(y) && fabsf(x) <= fabsf(z))
+                h[0] = 1.0f;
+            else if(fabsf(y) <= fabsf(z))
+                h[1] = 1.0f;
+            else
+                h[2] = 1.0f;
+            c[0] = y * h[2] - z * h[1]; c[1] = z * h[0] - x * h[2]; c[2] = x * h[1] - y * h[0];
+            cl = sqrtf(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+            c[0] /= cl; c[1] /= cl; c[2] /= cl;
+            wx = y * c[2] - z * c[1]; wy = z * c[0] - x * c[2]; wz = x * c[1] - y * c[0];
+            if(sh4dow_prepare(&f, NULL, limb, 3, ds[d]) != 3)
+                return fail("axes prepare");
+            if(!near(f.dir[0], x, 1.0e-5f) || !near(f.dir[1], y, 1.0e-5f) || !near(f.dir[2], z, 1.0e-5f) ||
+               !near(f.u[0], c[0], 1.0e-5f) || !near(f.u[1], c[1], 1.0e-5f) || !near(f.u[2], c[2], 1.0e-5f) ||
+               !near(f.w[0], wx, 1.0e-5f) || !near(f.w[1], wy, 1.0e-5f) || !near(f.w[2], wz, 1.0e-5f))
+                return fail("the side axes for this light");
+        }
+    }
+    /* The axes are unit and orthogonal for any light, and the rows are the axes. */
+    if(!near(f.dir[0] * f.dir[0] + f.dir[1] * f.dir[1] + f.dir[2] * f.dir[2], 1.0f, 1.0e-6f) ||
+       !near(f.u[0] * f.dir[0] + f.u[1] * f.dir[1] + f.u[2] * f.dir[2], 0.0f, 1.0e-6f) ||
+       !near(f.w[0] * f.u[0] + f.w[1] * f.u[1] + f.w[2] * f.u[2], 0.0f, 1.0e-6f))
+        return fail("the frame's axes");
+    return 0;
+}
+
 int main(void) {
     sh4dow_frame_t f;
 
     if(single(&f) || params(&f) || sorted_random() ||
-       ball_random(0) || ball_random(1) || capsule_random(0) || capsule_random(1) || direction())
+       ball_random(0) || ball_random(1) || capsule_random(0) || capsule_random(1) || direction() || projection())
         return 1;
     printf("ok\n");
     return 0;

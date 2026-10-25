@@ -19,17 +19,10 @@ static int is_finite(float x) {
     return (v.u & 0x7f800000u) != 0x7f800000u;
 }
 
-static float clamp01(float x) {
-    if(x < 0.0f)
-        return 0.0f;
-    if(x > 1.0f)
-        return 1.0f;
-    return x;
-}
-
-static float recip(float x) {
+/* 1 / x for x > 0: every caller has checked the sign, so no shz_invf() sign fix. */
+static float recip_pos(float x) {
 #ifndef SH4DOW_DC_NO_SH4ZAM
-    return shz_invf(x);
+    return shz_invf_fsrra(x);
 #else
     return 1.0f / x;
 #endif
@@ -47,19 +40,12 @@ static int params_valid(const sh4dow_params_t *p) {
    aligned with the light, so the cross product never degenerates. */
 static int basis(sh4dow_frame_t *f, const float d[3]) {
 #ifndef SH4DOW_DC_NO_SH4ZAM
-    shz_vec3_t dn, h, un, wn;
-    float ex, ey, ez;
+    shz_vec3_t dn, un, wn;
 
     dn = shz_vec3_normalize_safe(shz_vec3_init(d[0], d[1], d[2]));
     if(dn.x == 0.0f && dn.y == 0.0f && dn.z == 0.0f)
         return 0;
-    ex = shz_fabsf(dn.x);
-    ey = shz_fabsf(dn.y);
-    ez = shz_fabsf(dn.z);
-    h = (ex <= ey && ex <= ez) ? shz_vec3_init(1.0f, 0.0f, 0.0f) :
-        (ey <= ez)             ? shz_vec3_init(0.0f, 1.0f, 0.0f) :
-                                 shz_vec3_init(0.0f, 0.0f, 1.0f);
-    un = shz_vec3_normalize_safe(shz_vec3_cross(dn, h));
+    un = shz_vec3_normalize_safe(shz_vec3_perp(dn));   /* dn x that world axis */
     wn = shz_vec3_cross(dn, un);
     f->dir[0] = dn.x; f->dir[1] = dn.y; f->dir[2] = dn.z;
     f->u[0]   = un.x; f->u[1]   = un.y; f->u[2]   = un.z;
@@ -127,16 +113,16 @@ static void column_init(const sh4dow_frame_t *f, sh4dow_column_t *c,
     c->outer2 = c->outer * c->outer;
     c->inner2 = c->inner * c->inner;
     feather = c->outer - c->inner;
-    c->inv_feather = feather > 0.0f ? recip(feather) : 0.0f;
+    c->inv_feather = feather > 0.0f ? recip_pos(feather) : 0.0f;
     c->fade_w = p->fade_in > 0.0f ? p->fade_in * r : 0.0f;
-    c->top = c->fade_w > 0.0f ? recip(c->fade_w) : 1.0e8f;
+    c->top = c->fade_w > 0.0f ? recip_pos(c->fade_w) : 1.0e8f;
     c->bone = limb->bone;
 }
 
 /* sh4dow_strength_list()'s tables, relative to the mean joint so the disc
    test's expanded square does not cancel for a character far from the origin. */
 static void fast_tables(sh4dow_frame_t *f, const float sum[3]) {
-    const float inv_n = recip((float)f->count);
+    const float inv_n = recip_pos((float)f->count);
     float origin[3], o[3];
     int i;
 
@@ -205,11 +191,11 @@ int sh4dow_prepare(sh4dow_frame_t *frame, const sh4dow_params_t *params,
         return 0;
 
     frame->length = params->length;
-    frame->hold = clamp01(params->hold);
-    frame->dark = clamp01(params->dark);
+    frame->hold = sh4dow_sat_(params->hold);
+    frame->dark = sh4dow_sat_(params->dark);
     frame->hold_at = frame->hold * frame->length;
     span = frame->length - frame->hold_at;
-    frame->inv_fade = span > 0.0f ? recip(span) : 0.0f;
+    frame->inv_fade = span > 0.0f ? recip_pos(span) : 0.0f;
 
     col = frame->column;
     for(n = 0; n < limb_count && n < SH4DOW_COLUMN_MAX; n++) {
@@ -264,15 +250,9 @@ int sh4dow_prepare(sh4dow_frame_t *frame, const sh4dow_params_t *params,
 
 /* Squared distance across the light from (lu, lw) to the segment from a along (su, sw). */
 static float seg_dist2(float lu, float lw, const float a[3], float su, float sw, float inv_seg2) {
-    float s = ((lu - a[1]) * su + (lw - a[2]) * sw) * inv_seg2, du, dw;
+    const float s = sh4dow_sat_(((lu - a[1]) * su + (lw - a[2]) * sw) * inv_seg2);
 
-    if(s < 0.0f)
-        s = 0.0f;
-    if(s > 1.0f)
-        s = 1.0f;
-    du = lu - (a[1] + su * s);
-    dw = lw - (a[2] + sw * s);
-    return du * du + dw * dw;
+    return sh4dow_len2_(lu - (a[1] + su * s), lw - (a[2] + sw * s));
 }
 
 unsigned sh4dow_capsule_columns(const sh4dow_frame_t *frame, const float a[3], float ra,
@@ -294,8 +274,8 @@ unsigned sh4dow_capsule_columns(const sh4dow_frame_t *frame, const float a[3], f
     hi = a[0] + ra > b[0] + rb ? a[0] + ra : b[0] + rb;
     su = b[1] - a[1];
     sw = b[2] - a[2];
-    seg2 = su * su + sw * sw;
-    inv_seg2 = seg2 > 0.0f ? recip(seg2) : 0.0f;
+    seg2 = sh4dow_len2_(su, sw);
+    inv_seg2 = seg2 > 0.0f ? recip_pos(seg2) : 0.0f;
 
     for(j = 0; j < (unsigned)frame->count; j++) {
         const sh4dow_column_t *c = &frame->column[j];
