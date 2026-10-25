@@ -125,6 +125,26 @@ typedef struct sh4dow_disc {
     float outer2;               /**< \brief The column's, kept on this line. */
 } sh4dow_disc_t;
 
+/** \brief   One entry of a packed list: one 32-byte cache line, read front to back.
+
+    The side test is the plain distance to the axis, origin-relative: no
+    expanded square, so no precision limit on thin columns far from the origin.
+*/
+typedef struct sh4dow_entry {
+    float lu, lw;               /**< \brief The axis across the light, origin-relative. */
+    float outer2, inner2;       /**< \brief Feather and core radii, squared. */
+    float inner, inv_feather;   /**< \brief The column's. */
+    float t0r;                  /**< \brief The column's start, origin-relative (general entries). */
+    float top;                  /**< \brief The column's fade-in reciprocal (general entries). */
+} sh4dow_entry_t;
+
+/** \brief   What a pack tests per column (sh4dow_capsule_pack()), beside its ready entry. */
+typedef struct sh4dow_cull {
+    float outer;                /**< \brief Feather's outer radius. */
+    float fade_w;               /**< \brief Distance past the start before full strength. */
+    uint32_t bone;              /**< \brief The column's bone. */
+} sh4dow_cull_t;
+
 /** \brief   A character's columns for one frame (sh4dow_prepare()). */
 typedef struct sh4dow_frame {
     float dir[3], u[3], w[3];   /**< \brief Light axis and the two side axes, orthonormal. */
@@ -138,7 +158,25 @@ typedef struct sh4dow_frame {
     float rows[3][4];           /**< \brief (x, y, z, 1) onto the axes, origin-relative: a 3x4 for XMTRX. */
     sh4dow_disc_t disc[SH4DOW_COLUMN_MAX];     /**< \brief Per column, origin-relative. */
     float t0r[SH4DOW_COLUMN_MAX];              /**< \brief Per column start, origin-relative. */
+    sh4dow_entry_t entry[SH4DOW_COLUMN_MAX];   /**< \brief Per column, the packed entry, ready to copy. */
+    sh4dow_cull_t cull[SH4DOW_COLUMN_MAX];     /**< \brief Per column, the pack's reach test. */
 } sh4dow_frame_t;
+
+
+/** \brief   One bone's column list, packed for its vertex loop (sh4dow_ball_pack()).
+
+    The entries sit in list order on consecutive cache lines, with the frame
+    numbers the fades need, so sh4dow_strength_packed() walks one pointer and
+    reads nothing else.
+*/
+typedef struct sh4dow_packed {
+    sh4dow_entry_t entry[SH4DOW_COLUMN_MAX]; /**< \brief FULL entries first, then the rest in start order. */
+    float length, hold_at, inv_fade;         /**< \brief The frame's. */
+    uint8_t full;                            /**< \brief FULL entries, at the front. */
+    uint8_t count;                           /**< \brief All entries; 0: every vertex of the ball is unshaded. */
+    uint8_t solid;                           /**< \brief 1: the whole ball lies in a FULL column's core, every vertex is 1. */
+    /* The Dreamcast walk reads up to 12 bytes past the last entry: length, hold_at and inv_fade cover it. */
+} sh4dow_packed_t;
 
 /** \brief   The light and side axes, held in registers across a vertex loop. */
 typedef struct sh4dow_axes {
@@ -203,6 +241,59 @@ unsigned sh4dow_ball_columns(const sh4dow_frame_t *frame, float ct, float cu, fl
 unsigned sh4dow_capsule_columns(const sh4dow_frame_t *frame, const float a[3], float ra,
                                 const float b[3], float rb, unsigned own,
                                 uint8_t out[SH4DOW_COLUMN_MAX]);
+
+/** \brief   Pack a column list for sh4dow_strength_packed().
+    \param  frame           The prepared frame the list came from.
+    \param  list, n         From sh4dow_ball_columns() or sh4dow_capsule_columns().
+    \param  out             The packed list; solid is left 0.
+    \return                 Entries packed (n).
+*/
+unsigned sh4dow_pack(const sh4dow_frame_t *frame, const uint8_t *list, unsigned n, sh4dow_packed_t *out);
+
+/** \brief   sh4dow_capsule_columns() and sh4dow_pack() in one, plus the solid test.
+
+    out->count 0 means no vertex in the hull is shaded, and out->solid 1 means
+    every one is at full strength: either way the vertex loop can skip the
+    projection and write 0 or 1.
+
+    \param  frame           A prepared frame.
+    \param  a, ra, b, rb    The two balls, as sh4dow_capsule_columns().
+    \param  own             The vertices' first bone, or SH4DOW_BONE_NONE.
+    \param  out             The packed list.
+    \return                 Entries packed.
+*/
+unsigned sh4dow_capsule_pack(const sh4dow_frame_t *frame, const float a[3], float ra,
+                             const float b[3], float rb, unsigned own, sh4dow_packed_t *out);
+
+/** \brief   sh4dow_capsule_pack() for one ball.
+    \param  frame           A prepared frame.
+    \param  ct, cu, cw      Ball centre, projected (sh4dow_project()).
+    \param  r               Ball radius.
+    \param  own             The vertices' first bone, or SH4DOW_BONE_NONE.
+    \param  out             The packed list.
+    \return                 Entries packed.
+*/
+unsigned sh4dow_ball_pack(const sh4dow_frame_t *frame, float ct, float cu, float cw, float r,
+                          unsigned own, sh4dow_packed_t *out);
+
+/** \brief   sh4dow_strength_packed() over one bone's vertices.
+
+    An empty pack writes 0s and a solid one 1s without touching the
+    positions. Otherwise each vertex is projected (on the Dreamcast, one FTRV,
+    the next vertex's issued before this one is shaded, so the transform's
+    latency overlaps the shade) and shaded with the pack's numbers held in
+    registers. On the Dreamcast this loads the frame into XMTRX: load your own
+    matrix again afterwards.
+
+    \param  frame           The prepared frame the pack came from.
+    \param  p               The bone's pack.
+    \param  xyz             Vertex positions, xyz_stride bytes apart, every one inside the pack's ball.
+    \param  xyz_stride      Bytes from one position to the next.
+    \param  out             Strengths, 0..1, count floats.
+    \param  count           Number of vertices.
+*/
+void sh4dow_strength_packed_n(const sh4dow_frame_t *frame, const sh4dow_packed_t *p,
+                              const float *xyz, size_t xyz_stride, float *out, unsigned count);
 
 /** \brief   Darken float colours by the shade.
     \param  frame           A prepared frame.
@@ -381,8 +472,14 @@ unsigned sh4dow_pick_feet(const float *centre, const float *radius, unsigned cou
                           unsigned up_axis, unsigned side_axis, float lo, float hi, uint8_t out[2]);
 
 /* Private: the arithmetic both builds share. */
+#if defined(__GNUC__)
+#define SH4DOW_FORCE_INLINE_ static inline __attribute__((always_inline))
+#else
+#define SH4DOW_FORCE_INLINE_ static inline
+#endif
 #ifndef SH4DOW_DC_NO_SH4ZAM
 static inline float sh4dow_sqrt_(float x) { return shz_sqrtf(x); }
+static inline float sh4dow_sqrt_pos_(float x) { return shz_sqrtf_fsrra(x); }   /* x > 0: no zero guard */
 static inline float sh4dow_sat_(float x) { return shz_saturatef(x); }
 
 static inline float sh4dow_smooth01(float t) {
@@ -398,6 +495,7 @@ static inline float sh4dow_disc_(const sh4dow_disc_t *d, float vu, float vw, flo
 static inline float sh4dow_len2_(float a, float b) { return shz_vec2_magnitude_sqr(shz_vec2_init(a, b)); }
 #else
 static inline float sh4dow_sqrt_(float x) { return sqrtf(x); }
+static inline float sh4dow_sqrt_pos_(float x) { return sqrtf(x); }
 static inline float sh4dow_sat_(float x) { return x < 0.0f ? 0.0f : x > 1.0f ? 1.0f : x; }
 
 static inline float sh4dow_smooth01(float t) {
@@ -420,10 +518,23 @@ static inline float sh4dow_feather_(float perp2, float inner, float inv_feather)
     return 1.0f - sh4dow_smooth01((sh4dow_sqrt_(perp2) - inner) * inv_feather);
 }
 
+/* sh4dow_feather_() for inner2 < perp2 < outer2, as the packed loop guarantees: perp2 > 0, so no zero guard, and
+   the ramp is in 0..1 up to rounding, which lands on smoothstep's flat ends, so no clamps. Three compares and
+   branches fewer on a feather hit, for the same shade. */
+static inline float sh4dow_feather_in_(float perp2, float inner, float inv_feather) {
+    const float t = (sh4dow_sqrt_pos_(perp2) - inner) * inv_feather;
+
+    return 1.0f - t * t * (3.0f - 2.0f * t);
+}
+
 /* core scaled by the fade-in and the fade-out, t past the column's start. */
-static inline float sh4dow_span_(const sh4dow_frame_t *f, float core, float t, float top) {
-    const float out = t > f->hold_at ? 1.0f - sh4dow_smooth01((t - f->hold_at) * f->inv_fade) : 1.0f;
+static inline float sh4dow_fades_(float core, float t, float top, float hold_at, float inv_fade) {
+    const float out = t > hold_at ? 1.0f - sh4dow_smooth01((t - hold_at) * inv_fade) : 1.0f;
     return core * sh4dow_sat_(t * top) * out;
+}
+
+static inline float sh4dow_span_(const sh4dow_frame_t *f, float core, float t, float top) {
+    return sh4dow_fades_(core, t, top, f->hold_at, f->inv_fade);
 }
 
 /** \brief   Load a frame's axes for a vertex loop.
@@ -642,6 +753,151 @@ static inline float sh4dow_strength_list(const sh4dow_frame_t *frame, float vt, 
     }
 
     return dark;
+}
+
+/** \brief   Shade strength at a projected vertex, against a packed list.
+
+    sh4dow_strength_list() over the same list, with the side test done as a
+    plain distance rather than an expanded square: the same strength as
+    sh4dow_strength(), without sh4dow_strength_list()'s precision note. Each
+    entry is one cache line read from the front.
+
+    \param  p               From sh4dow_ball_pack(), sh4dow_capsule_pack() or sh4dow_pack().
+    \param  vt, vu, vw      The vertex, from sh4dow_project(), inside the list's ball.
+    \return                 0..1, as sh4dow_strength().
+*/
+/* The packed walk on plain values, so a vertex loop holds them in registers rather than reloading the pack. */
+/* The first entry from f before end whose column the vertex is inside (perp2 < outer2): its address, with
+   *perp2 set; end when there is none. Entries are 8 floats, lu, lw, outer2 first. */
+SH4DOW_FORCE_INLINE_ const float *sh4dow_scan_c_(const float *f, const float *end, float vu, float vw, float *perp2) {
+    for(; f < end; f += 8) {
+        const float du = f[0] - vu, dw = f[1] - vw, p2 = du * du + dw * dw;
+
+        if(p2 < f[2]) {
+            *perp2 = p2;
+            break;
+        }
+    }
+    return f;
+}
+
+/* The assembly side test is opt-in (-DSH4DOW_ASM_SCAN): on the pipeline emulator it lands within code-placement
+   noise of the C walk, so it waits for a hardware A/B. */
+#if !defined(SH4DOW_DC_NO_SH4ZAM) && SHZ_BACKEND == SHZ_SH4 && defined(SH4DOW_ASM_SCAN)
+#define SH4DOW_HAVE_ASM_ 1
+/* Two entries a pass, interleaved, so one's load, subtract, square and sum fill the other's latency; squares by
+   FMUL and FADD, not FMAC, so nothing waits on FR0; a miss falls through. It reads the second entry of a pass
+   even when the first is the last one: up to 12 bytes past the end, which sh4dow_packed_t keeps inside itself. */
+SH4DOW_FORCE_INLINE_ const float *sh4dow_scan_asm_(const float *f, const float *end, float vu, float vw, float *perp2) {
+    /* fv4 only: fv8 is where FTRV leaves the next vertex in flight (sh4dow_strength_packed_n()). */
+    register float a1 __asm__("fr4");
+    register float b1 __asm__("fr5");
+    register float a2 __asm__("fr6");
+    register float b2 __asm__("fr7");
+    const float *g;
+
+    __asm__ (
+        "0:\n\t"
+        "cmp/hs  %[end], %[f]\n\t"
+        "bt      9f\n\t"
+        "mov     %[f], %[g]\n\t"
+        "fmov.s  @%[g]+, %[a1]\n\t"     /* lu */
+        "fmov.s  @%[g]+, %[b1]\n\t"     /* lw */
+        "add     #24, %[g]\n\t"
+        "fmov.s  @%[g]+, %[a2]\n\t"
+        "fsub    %[vu], %[a1]\n\t"
+        "fmov.s  @%[g]+, %[b2]\n\t"
+        "fsub    %[vw], %[b1]\n\t"
+        "fsub    %[vu], %[a2]\n\t"
+        "fsub    %[vw], %[b2]\n\t"
+        "fmul    %[a1], %[a1]\n\t"
+        "fmul    %[b1], %[b1]\n\t"
+        "fmul    %[a2], %[a2]\n\t"
+        "fmul    %[b2], %[b2]\n\t"
+        "fadd    %[b1], %[a1]\n\t"      /* perp2, first */
+        "add     #-32, %[g]\n\t"
+        "fmov.s  @%[g], %[b1]\n\t"      /* outer2, first */
+        "fadd    %[b2], %[a2]\n\t"      /* perp2, second */
+        "add     #32, %[g]\n\t"
+        "fmov.s  @%[g], %[b2]\n\t"      /* outer2, second */
+        "fcmp/gt %[a1], %[b1]\n\t"      /* outer2 > perp2: inside the first */
+        "bt      9f\n\t"
+        "add     #32, %[f]\n\t"
+        "cmp/hs  %[end], %[f]\n\t"
+        "bt      9f\n\t"
+        "fcmp/gt %[a2], %[b2]\n\t"
+        "bt      8f\n\t"
+        "bra     0b\n\t"
+        "add     #32, %[f]\n\t"         /* delay slot */
+        "8:\n\t"
+        "fmov    %[a2], %[a1]\n\t"
+        "9:\n\t"
+        : [f] "+r" (f), [g] "=&r" (g), [a1] "=&f" (a1), [b1] "=&f" (b1), [a2] "=&f" (a2), [b2] "=&f" (b2)
+        : [end] "r" (end), [vu] "f" (vu), [vw] "f" (vw)
+        : "t", "memory");
+    (void)g; (void)b1; (void)a2; (void)b2;
+    *perp2 = a1;
+    return f;
+}
+#else
+#define SH4DOW_HAVE_ASM_ 0
+#define sh4dow_scan_asm_ sh4dow_scan_c_
+#endif
+
+/* The packed walk on plain values, so a vertex loop holds them in registers rather than reloading the pack. */
+SH4DOW_FORCE_INLINE_ float sh4dow_entries_impl_(const sh4dow_entry_t *e, const sh4dow_entry_t *end_full,
+                                                 const sh4dow_entry_t *end, float length, float hold_at, float inv_fade,
+                                                 float vt, float vu, float vw, int use_asm) {
+    const float *f = &e->lu, *const ff = &end_full->lu, *const fe = &end->lu;
+    float dark = 0.0f, perp2 = 0.0f;
+
+    /* FULL entries: no fades. f[3] inner2, f[4] inner, f[5] inv_feather. */
+    for(;;) {
+        float s;
+
+        f = use_asm ? sh4dow_scan_asm_(f, ff, vu, vw, &perp2) : sh4dow_scan_c_(f, ff, vu, vw, &perp2);
+        if(f >= ff)
+            break;
+        if(perp2 <= f[3])
+            return 1.0f;
+        s = sh4dow_feather_in_(perp2, f[4], f[5]);
+        if(s > dark)
+            dark = s;
+        f += 8;
+    }
+    f = ff;
+    /* General entries, in start order: f[6] t0r, f[7] top. */
+    for(;;) {
+        float t, s;
+
+        f = use_asm ? sh4dow_scan_asm_(f, fe, vu, vw, &perp2) : sh4dow_scan_c_(f, fe, vu, vw, &perp2);
+        if(f >= fe)
+            break;
+        t = vt - f[6];
+        if(t <= 0.0f)
+            break;              /* Later general entries start further along. */
+        if(t < length) {
+            s = perp2 <= f[3] ? 1.0f : sh4dow_feather_in_(perp2, f[4], f[5]);
+            s = sh4dow_fades_(s, t, f[7], hold_at, inv_fade);
+            if(s > dark)
+                dark = s;
+            if(dark >= 1.0f)
+                break;
+        }
+        f += 8;
+    }
+
+    return dark;
+}
+
+SH4DOW_FORCE_INLINE_ float sh4dow_entries_(const sh4dow_entry_t *e, const sh4dow_entry_t *end_full, const sh4dow_entry_t *end,
+                                            float length, float hold_at, float inv_fade, float vt, float vu, float vw) {
+    return sh4dow_entries_impl_(e, end_full, end, length, hold_at, inv_fade, vt, vu, vw, SH4DOW_HAVE_ASM_);
+}
+
+static inline float sh4dow_strength_packed(const sh4dow_packed_t *p, float vt, float vu, float vw) {
+    return sh4dow_entries_(p->entry, p->entry + p->full, p->entry + p->count,
+                           p->length, p->hold_at, p->inv_fade, vt, vu, vw);
 }
 
 #ifdef __cplusplus

@@ -8,10 +8,11 @@ This folder is the whole library. It stands alone: no game header, no game data.
 - `src/sh4dow_dc.c` is `sh4dow_prepare` and `sh4dow_shade`: the soft limb self-shadow.
 - `src/sh4dow_foot.c` is the foot cones: `sh4dow_foot_place`, `sh4dow_foot_cone`, `sh4dow_foot_range_fade`, the picture and `sh4dow_pick_feet`. It needs no frame and nothing from `sh4dow_dc.c` but the header; link it only when you draw cones.
 - `test/shade_test.c`, `test/foot_test.c`, `example/example.c`, `example/quickstart.c` and `example/feet.c` run with `make test`; `make test-shz SH4ZAM=...` runs the two tests on the SH4ZAM path. `make dc SH4ZAM=...` builds the Dreamcast library from both sources.
+- `bench/bench.c` times the every-column, list and packed vertex loops on the console: `make bench SH4ZAM=...` builds `build/bench.elf`. Built with `-DSH4DOW_DC_NO_SH4ZAM` it runs on a host to check its numbers, not its times.
 - `README.md` is the explanation. The shipped numbers and what raising them does live there. Do not paste those tables into this file.
 - `LICENSE` is the license.
 
-There is no `.s` file. On the Dreamcast the square roots and the reciprocals are FSRRA inside [SH4ZAM](https://github.com/gyrovorbis/sh4zam) (0.10 or later), and its vector and matrix routines do the dots, the cross and the 3x4 transform. Compile the sources without `SH4DOW_DC_NO_SH4ZAM` and link SH4ZAM. Use SH4ZAM as a library; do not copy its files into this folder. Keep Falco Girgis's MIT notice with SH4ZAM.
+There is no `.s` file. The one piece of SH-4 assembly is inline in the header and off by default: `sh4dow_scan_asm_`, a packed-walk side test, built with `-DSH4DOW_ASM_SCAN` for a hardware A/B (on the pipeline emulator it is within code-placement noise of the C walk). `make test-dc` runs the tests on the Dreamcast path in Flycast; `bench/pipeline.sh` times `build/bench.elf` on WoWDC's cache/pipeline Flycast. Judge a change by that emulator or the console, not by plain Flycast, and only by differences larger than its 10 to 15% placement noise. On the Dreamcast the square roots and the reciprocals are FSRRA inside [SH4ZAM](https://github.com/gyrovorbis/sh4zam) (0.10 or later), and its vector and matrix routines do the dots, the cross and the 3x4 transform. Compile the sources without `SH4DOW_DC_NO_SH4ZAM` and link SH4ZAM. Use SH4ZAM as a library; do not copy its files into this folder. Keep Falco Girgis's MIT notice with SH4ZAM.
 
 `SH4DOW_DC_NO_SH4ZAM` compiles the same steps as plain C for a host tool or a game that does not ship SH4ZAM. That path does not need the SH4ZAM credit.
 
@@ -25,6 +26,7 @@ Units. The soft shadow takes your vertex units. The foot cones' distances are in
 4. `sh4dow_prepare` once per character per frame. `direction` is the way the shadow falls, away from the light, in that same space. It does not need to be unit length. Straight down is `(0, 0, -1)` when Z is up and `(0, -1, 0)` when Y is up.
 5. `sh4dow_shade` on the vertices you are about to draw. Then pack the color for the GPU yourself. There is no second draw and no video memory.
    Or, in your own loop: `sh4dow_axes` once, then `sh4dow_strength` per vertex (0..1), and darken or tint the colour yourself.
+   Fastest, per bone: `sh4dow_load_xmtrx` once per frame, `sh4dow_project` the bone's ball centre, `sh4dow_ball_pack` (or `sh4dow_capsule_pack` for blended vertices). If `count` is 0 every vertex is 0; if `solid` every vertex is 1; otherwise one FTRV per vertex and `sh4dow_strength_packed`. With the bone's positions in an array, `sh4dow_strength_packed_n` does all of that, overlaps each FTRV with the previous vertex's shade, and is the fastest path. `sh4dow_load_xmtrx` replaces XMTRX, so load your own matrix back afterwards.
 
 `xyz_stride` and `rgb_stride` are byte steps. A packed `float[3]` uses 12. A bone inside a vertex struct uses `sizeof` that struct as `bone_stride`. Pass `bone0 == NULL` to turn the first-bone skip off.
 
