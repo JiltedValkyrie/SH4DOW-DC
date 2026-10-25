@@ -1,0 +1,14 @@
+SH4DOW-DC
+Copyright (c) 2026 Emerald May
+
+Originally developed for Halo: Dreamcast Evolved
+
+Permission is granted, free of charge, to use, modify, and incorporate SH4DOW-DC into personal and commercial software, including games, engines, and applications.
+
+Attribution to the original author is required in an accessible credits, acknowledgments, or third-party notices section. Redistributions of the source must retain the original copyright and license notices.
+
+The original implementation, or substantially similar derivatives, may not be sold as standalone shadow-rendering source code, libraries, plugins, or software packages.
+
+Commercial distribution of larger products incorporating this implementation is expressly permitted.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
