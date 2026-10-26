@@ -156,6 +156,18 @@ static void fast_tables(sh4dow_frame_t *f, const float sum[3]) {
         d->inv_feather = c->inv_feather;
         d->outer2 = c->outer2;
         f->t0r[i] = c->t0 - f->ot;
+
+        f->entry[i].lu = lu;
+        f->entry[i].lw = lw;
+        f->entry[i].outer2 = c->outer2;
+        f->entry[i].inner2 = c->inner2 > 1.0e-30f ? c->inner2 : 1.0e-30f;   /* a feather hit then has perp2 > 0 */
+        f->entry[i].inner = c->inner;
+        f->entry[i].inv_feather = c->inv_feather;
+        f->entry[i].t0r = f->t0r[i];
+        f->entry[i].top = c->top;
+        f->cull[i].outer = c->outer;
+        f->cull[i].fade_w = c->fade_w;
+        f->cull[i].bone = c->bone;
     }
 }
 
@@ -316,6 +328,182 @@ unsigned sh4dow_ball_columns(const sh4dow_frame_t *frame, float ct, float cu, fl
     const float c[3] = { ct, cu, cw };
 
     return sh4dow_capsule_columns(frame, c, r, c, r, own, out);
+}
+
+/* 32 bytes as eight words: a struct assignment this size is a __movmem call on the SH-4. */
+static void copy_entry(sh4dow_entry_t *dst, const sh4dow_entry_t *src) {
+    const uint32_t *a = (const uint32_t *)src;
+    uint32_t *b = (uint32_t *)dst;
+    const uint32_t w0 = a[0], w1 = a[1], w2 = a[2], w3 = a[3], w4 = a[4], w5 = a[5], w6 = a[6], w7 = a[7];
+
+    b[0] = w0; b[1] = w1; b[2] = w2; b[3] = w3; b[4] = w4; b[5] = w5; b[6] = w6; b[7] = w7;
+}
+
+static void pack_head(const sh4dow_frame_t *frame, sh4dow_packed_t *out) {
+    out->length = frame->length;
+    out->hold_at = frame->hold_at;
+    out->inv_fade = frame->inv_fade;
+}
+
+unsigned sh4dow_pack(const sh4dow_frame_t *frame, const uint8_t *list, unsigned n, sh4dow_packed_t *out) {
+    unsigned k, full = 0;
+
+    if(!out)
+        return 0;
+    out->count = out->full = out->solid = 0;
+    if(!frame || !list || frame->count <= 0)
+        return 0;
+    if(n > SH4DOW_COLUMN_MAX)
+        n = SH4DOW_COLUMN_MAX;
+    pack_head(frame, out);
+
+    for(k = 0; k < n; k++) {
+        copy_entry(&out->entry[k], &frame->entry[list[k] & SH4DOW_LIST_INDEX]);
+        if(full == k && (list[k] & SH4DOW_LIST_FULL))
+            full++;             /* A FULL entry after a general one stays general: the same strength. */
+    }
+    out->full = (uint8_t)full;
+    out->count = (uint8_t)n;
+    return n;
+}
+
+/* GCC's induction variable pass gives every entry field its own pointer, rebuilt per vertex: off, it walks one. */
+#if defined(__GNUC__) && !defined(__clang__)
+__attribute__((optimize("no-ivopts")))
+#endif
+void sh4dow_strength_packed_n(const sh4dow_frame_t *frame, const sh4dow_packed_t *p,
+                              const float *xyz, size_t xyz_stride, float *out, unsigned count) {
+    const sh4dow_entry_t *e, *end_full, *end;
+    const char *src = (const char *)xyz;
+    float length, hold_at, inv_fade;
+    unsigned i;
+
+    if(!frame || !p || !out || !count)
+        return;
+    if(!p->count || p->solid) {
+        const float s = p->solid ? 1.0f : 0.0f;
+
+        for(i = 0; i < count; i++)
+            out[i] = s;
+        return;
+    }
+    if(!xyz)
+        return;
+    e = p->entry;
+    end_full = e + p->full;
+    end = e + p->count;
+    length = p->length;
+    hold_at = p->hold_at;
+    inv_fade = p->inv_fade;
+
+#ifndef SH4DOW_DC_NO_SH4ZAM
+    sh4dow_load_xmtrx(frame);
+    for(i = 0; i < count; i++, src += xyz_stride) {
+        const float *v = (const float *)src;
+        const shz_vec3_t q = shz_xmtrx_transform_point3(shz_vec3_init(v[0], v[1], v[2]));
+
+        out[i] = sh4dow_entries_(e, end_full, end, length, hold_at, inv_fade, q.x, q.y, q.z);
+    }
+#else
+    for(i = 0; i < count; i++, src += xyz_stride) {
+        const float *v = (const float *)src;
+        float q[3];
+
+        sh4dow_project(frame, v[0], v[1], v[2], q);
+        out[i] = sh4dow_entries_(e, end_full, end, length, hold_at, inv_fade, q[0], q[1], q[2]);
+    }
+#endif
+}
+
+/* Squared distance across the light from (lu, lw) to the point p. */
+static float point_dist2(float lu, float lw, const float p[3]) {
+    return sh4dow_len2_(lu - p[1], lw - p[2]);
+}
+
+/* sh4dow_capsule_columns() and sh4dow_pack() in one pass over the frame's ready entries and reach table; the
+   list is the same, FULL entries first by distance, then the rest in start order. */
+unsigned sh4dow_capsule_pack(const sh4dow_frame_t *frame, const float a[3], float ra,
+                             const float b[3], float rb, unsigned own, sh4dow_packed_t *out) {
+    uint8_t idx[SH4DOW_COLUMN_MAX];
+    float key[SH4DOW_COLUMN_MAX], lo, hi, r, su, sw, seg2, inv_seg2, length, hold_at;
+    unsigned n = 0, full = 0, j, k, count, solid = 0;
+    const int ball = a && b && a[0] == b[0] && a[1] == b[1] && a[2] == b[2];
+
+    if(!out)
+        return 0;
+    out->count = out->full = out->solid = 0;
+    if(!frame || frame->count <= 0 || !a || !b)
+        return 0;
+    if(!(ra >= 0.0f))
+        ra = 0.0f;
+    if(!(rb >= 0.0f))
+        rb = 0.0f;
+    pack_head(frame, out);
+
+    r = ra > rb ? ra : rb;
+    lo = a[0] - ra < b[0] - rb ? a[0] - ra : b[0] - rb;
+    hi = a[0] + ra > b[0] + rb ? a[0] + ra : b[0] + rb;
+    su = b[1] - a[1];
+    sw = b[2] - a[2];
+    seg2 = sh4dow_len2_(su, sw);
+    inv_seg2 = seg2 > 0.0f ? recip_pos(seg2) : 0.0f;
+    length = frame->length;
+    hold_at = frame->hold_at;
+    count = (unsigned)frame->count;
+
+    for(j = 0; j < count; j++) {
+        const sh4dow_entry_t *e = &frame->entry[j];
+        const sh4dow_cull_t *c = &frame->cull[j];
+        const float t0 = e->t0r, reach = r + c->outer;
+        float d2;
+
+        if(hi <= t0)
+            break;              /* This column and every later one start past the hull. */
+        if(lo >= t0 + length || (own == c->bone && own != SH4DOW_BONE_NONE))
+            continue;
+        d2 = ball ? point_dist2(e->lu, e->lw, a) : seg_dist2(e->lu, e->lw, a, su, sw, inv_seg2);
+        if(d2 >= reach * reach)
+            continue;
+
+        if(lo > t0 + c->fade_w + FULL_SLACK && hi < t0 + hold_at - FULL_SLACK) {
+            /* Solid: the core holds the whole hull. Its farthest point from the axis is within r of an end,
+               the distance being convex along a..b. */
+            if(!solid) {
+                const float core = e->inner - r, far2 = ball ? d2 :
+                    (point_dist2(e->lu, e->lw, a) > point_dist2(e->lu, e->lw, b) ?
+                     point_dist2(e->lu, e->lw, a) : point_dist2(e->lu, e->lw, b));
+
+                solid = core > 0.0f && far2 < core * core;
+            }
+            for(k = n; k > full; k--)
+                idx[k] = idx[k - 1];
+            for(k = full; k > 0 && key[k - 1] > d2; k--) {
+                idx[k] = idx[k - 1];
+                key[k] = key[k - 1];
+            }
+            idx[k] = (uint8_t)j;
+            key[k] = d2;
+            full++;
+            n++;
+        }
+        else {
+            idx[n++] = (uint8_t)j;
+        }
+    }
+
+    for(k = 0; k < n; k++)
+        copy_entry(&out->entry[k], &frame->entry[idx[k]]);
+    out->full = (uint8_t)full;
+    out->count = (uint8_t)n;
+    out->solid = (uint8_t)solid;
+    return n;
+}
+
+unsigned sh4dow_ball_pack(const sh4dow_frame_t *frame, float ct, float cu, float cw, float r,
+                          unsigned own, sh4dow_packed_t *out) {
+    const float c[3] = { ct, cu, cw };
+
+    return sh4dow_capsule_pack(frame, c, r, c, r, own, out);
 }
 
 void sh4dow_shade(const sh4dow_frame_t *frame,

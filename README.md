@@ -79,6 +79,7 @@ Two ways to evaluate a vertex:
 
 1. **Every column** (`sh4dow_strength`, `sh4dow_shade`). One dot product puts the vertex on the light axis; a vertex outside every column's span stops there. The columns are sorted by start, so the loop stops at the first column that starts past the vertex.
 2. **Column lists** (`sh4dow_ball_columns`, `sh4dow_strength_list`). If you know a ball that holds every vertex of a bone (its posed node sphere, grown by anything that moves vertices after skinning), list once per bone per frame the columns that ball can touch. A column whose full-strength span holds the whole ball is flagged, and costs one dot product and one compare per vertex. A vertex blended between two bones lies in the hull of two balls: `sh4dow_capsule_columns`. The list only drops columns that cannot reach the ball, so the result is the same strength up to float rounding (see Cost).
+3. **Packed lists** (`sh4dow_ball_pack`, `sh4dow_capsule_pack`, `sh4dow_strength_packed`). The same list, copied once per bone into consecutive 32-byte entries that hold everything the vertex loop reads, so it walks one pointer instead of indexing the 3 KB frame. The side test is the plain distance to the axis, not the expanded square, so it has no precision note and stays within 1e-5 of the every-column loop. A pack also says when no vertex in the ball can be shaded (`count` 0) or every one is at full strength (`solid`, the ball inside a column's core): skip that bone's projections and write 0 or 1. `sh4dow_strength_packed_n` runs a whole bone: it does those skips, holds the pack's numbers in registers, and issues the next vertex's FTRV before shading the current one, so the transform's latency overlaps the shade. It is the fastest way to use the library when your positions sit in an array.
 
 ## API
 
@@ -95,6 +96,10 @@ Everything is in `include/sh4dow_dc.h`. The per-vertex functions are `static inl
 | `sh4dow_capsule_columns` | per bone pair, per frame | the same for the hull of two balls (a blended vertex) |
 | `sh4dow_strength_list` | per vertex | the strength from the projection, against a list |
 | `sh4dow_strength_rel` | per vertex | the strength from the projection, against every column |
+| `sh4dow_ball_pack`, `sh4dow_capsule_pack` | per bone, per frame | the list, packed for the vertex loop, with the empty (`count` 0) and `solid` flags |
+| `sh4dow_pack` | per list | packs a list you already have; no `solid` test |
+| `sh4dow_strength_packed` | per vertex | the strength from the projection, against a packed list |
+| `sh4dow_strength_packed_n` | per bone | the strengths of a bone's vertices into a float array: skips, FTRV overlapped (loads XMTRX on the Dreamcast) |
 
 The prototypes, as the header declares them (the test suite compiles this block against the header):
 
@@ -117,6 +122,14 @@ static inline float sh4dow_strength(const sh4dow_frame_t *frame, const sh4dow_ax
 static inline float sh4dow_strength_rel(const sh4dow_frame_t *frame, float vt, float vu, float vw, unsigned own);
 static inline float sh4dow_strength_list(const sh4dow_frame_t *frame, float vt, float vu, float vw,
                                          const uint8_t *list, unsigned n);
+unsigned sh4dow_pack(const sh4dow_frame_t *frame, const uint8_t *list, unsigned n, sh4dow_packed_t *out);
+unsigned sh4dow_capsule_pack(const sh4dow_frame_t *frame, const float a[3], float ra,
+                             const float b[3], float rb, unsigned own, sh4dow_packed_t *out);
+unsigned sh4dow_ball_pack(const sh4dow_frame_t *frame, float ct, float cu, float cw, float r,
+                          unsigned own, sh4dow_packed_t *out);
+static inline float sh4dow_strength_packed(const sh4dow_packed_t *p, float vt, float vu, float vw);
+void sh4dow_strength_packed_n(const sh4dow_frame_t *frame, const sh4dow_packed_t *p,
+                              const float *xyz, size_t xyz_stride, float *out, unsigned count);
 ```
 
 Types: `sh4dow_limb_t` (position, radius, bone, flags), `sh4dow_params_t` (the Tuning table), `sh4dow_frame_t` (about 3 KB: up to `SH4DOW_COLUMN_MAX` = 32 columns and their tables; one per character drawn, or one reused). `own` is a vertex's first bone, or `SH4DOW_BONE_NONE` for no skip. The lists: `SH4DOW_LIST_INDEX` masks the column, `SH4DOW_LIST_FULL` marks an entry the fades do not touch.
@@ -125,7 +138,7 @@ Rules of use:
 
 - Call `sh4dow_prepare` after posing and before the vertex pass. `direction` may be any length; a zero or non-finite direction, or bad params, store no columns and return 0.
 - The list functions are exact for points inside the ball and say nothing about points outside it. Give the ball a radius that really holds the vertices.
-- `sh4dow_strength_list` expands the distance test algebraically, so a column far thinner than its distance from the frame's origin (the mean joint) loses precision: about one colour step at a ratio of 1:100, a wrong answer near 1:3000. Keep such limbs out of the list loop, or use `sh4dow_strength`.
+- `sh4dow_strength_list` expands the distance test algebraically, so a column far thinner than its distance from the frame's origin (the mean joint) loses precision: about one colour step at a ratio of 1:100, a wrong answer near 1:3000. Keep such limbs out of the list loop, or use `sh4dow_strength` or `sh4dow_strength_packed`.
 - Nothing allocates, touches globals or needs a floating point mode. Separate frames are independent, so separate threads may use separate frames.
 
 ## Tuning
@@ -262,6 +275,21 @@ Cost: a cone is a few dozen multiplies, a handful of dot products and three reci
 
 The 4.5 ms is one hardware run of that scene as the game's author timed it, not a benchmark suite. It includes everything the sorting, the column lists and the SH4ZAM routines changed together, not one trick alone.
 
+**Packed lists, not yet measured on hardware.** `make bench` builds `build/bench.elf`: six figures, 84 columns, 5376 vertices, timing the every-column loop, the list loop and the packed loop with the SH-4 performance counter, and printing each fast loop's largest difference from the every-column loop on screen and to dcload. On the SH-4 code GCC emits, a listed column the vertex misses costs about 15 instructions in the packed loop against about 29 in the list loop (no index byte, shift and large frame offset per column), and in that scene 12 of the 84 bones skip their vertices (6 empty, 6 solid).
+
+On WoWDC's cache and pipeline timing Flycast (Bruceleeto's `cache` branch: SH-4 latencies, dual issue and the direct-mapped caches modelled; `bench/pipeline.sh` runs it), the same scene:
+
+| Loop | Time | Cycles a vertex | Largest difference from every column |
+| --- | --- | --- | --- |
+| every column, `sh4dow_strength` | 6294 us | 234 | (the reference) |
+| list, `sh4dow_strength_list` | 4273 us | 159 | 0.000030 |
+| packed, `sh4dow_strength_packed` in the bench's own loop | 2490 us | 92 | 0.000029 |
+| `sh4dow_strength_packed_n` per bone | 2278 us | 84 | 0.000029 |
+
+`sh4dow_strength_packed_n` is 1.88 times the list loop. Plain Flycast, which charges about one cycle an instruction, gives 1.55. That emulator is deterministic for one ELF but moves 10 to 15% with code placement (the same loop at another address measured 2618 us), so only the large differences here are findings. The bench's `ab` rows run variants inside one ELF.
+
+What moved it: the packed entries (one pointer, no per-column index decode); the pack built in one pass from entries `sh4dow_prepare` makes once a frame (the pack alone went from 687 to 371 us there); the feather without its zero guard and clamps; the empty and solid bone skips. Tried and left out, for no measured gain: an inline-assembly side test, two entries a pass (`-DSH4DOW_ASM_SCAN` keeps it for a hardware A/B), a batched FTRV pass into a buffer, prefetching the positions, and `movca.l` on the output.
+
 Why it is cheap: the CPU already holds every vertex to transform it (the SH-4 has no vertex shader). The shade is a few dot products on that vertex, and the colour write it was already going to do. Nothing extra is drawn or stored. The soft edge is a fade, so it costs the same as a hard one.
 
 ## Build and test
@@ -270,11 +298,13 @@ Why it is cheap: the CPU already holds every vertex to transform it (the SH-4 ha
 make test                        # host, plain C: test/shade_test, test/foot_test, example/example, example/quickstart, example/feet
 make test-shz SH4ZAM=/path/to/sh4zam   # host, the SH4ZAM path on SH4ZAM's software back-end: the same two tests
 make dc SH4ZAM=/path/to/sh4zam   # Dreamcast: build/libsh4dow_dc.a, both objects (KallistiOS environment sourced)
+make bench SH4ZAM=/path/to/sh4zam  # Dreamcast: build/bench.elf, the three vertex loops timed on the console
+make test-dc SH4ZAM=/path/to/sh4zam  # Dreamcast: build/shade_test.elf, build/foot_test.elf (the assembly path); run in Flycast or on the console
 ```
 
 The Dreamcast build wants SH4ZAM's include path and the flags its fast paths expect: `-ffast-math -ffp-contract=fast -mfsrra -mfsca -fno-math-errno`. Link SH4ZAM's library as you already do, and do not copy SH4ZAM's files into your project: use it as a library, at 0.10 or later. The library needs no KallistiOS header.
 
-`test/shade_test.c`: one column's core, feather, fade-out, lit side and own-bone skip; a grid and random 14-limb frames against the plain formula with no early-outs; ball lists and capsule lists against the every-column loop, with a shrunk ball and a shrunk capsule that must be caught; a figure under a straight-down and a leaning light: the shade falls away from the light, the chin stays lit, a mirrored figure mirrors.
+`test/shade_test.c`: one column's core, feather, fade-out, lit side and own-bone skip; a grid and random 14-limb frames against the plain formula with no early-outs; ball lists and capsule lists against the every-column loop, with a shrunk ball and a shrunk capsule that must be caught; packed lists against the every-column loop, solid and empty packs; a figure under a straight-down and a leaning light: the shade falls away from the light, the chin stays lit, a mirrored figure mirrors.
 
 `test/foot_test.c`: the shipped numbers; the cone on a flat floor under a 45 degree light, an overhead one, a horizon one and no light at all; the walls, ceilings and storeys it refuses; the fade as the heel rises; a sloped floor, a Y up world and another unit giving the same cone; the placement and its clamps; the distance fade with a scope; the picture (full at the heel, empty at the far end, mirror symmetric, one texel at a time against the byte and RGB565 textures); the foot finder on Z up and Y up skeletons, one foot, two feet on one side, hovering. Both tests run on the plain C path and on the SH4ZAM path.
 

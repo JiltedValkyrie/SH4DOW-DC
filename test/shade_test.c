@@ -20,6 +20,12 @@
 #endif
 #define TOL  SH4DOW_TEST_TOL
 
+/* The packed list against sh4dow_strength(): both test the plain distance, so only the projection's rounding
+   (about 1e-5 on the plain C path); a build with approximate roots needs TOL. */
+#ifndef SH4DOW_TEST_PACKED_TOL
+#define SH4DOW_TEST_PACKED_TOL TOL
+#endif
+
 static int fail(const char *msg) {
     fprintf(stderr, "FAIL %s\n", msg);
     return 1;
@@ -27,6 +33,25 @@ static int fail(const char *msg) {
 
 static int near(float a, float b, float tol) {
     return fabsf(a - b) <= tol;
+}
+
+static unsigned packed_solid, packed_empty, packed_balls;
+static float packed_worst;
+
+/* sh4dow_strength_packed() against sh4dow_strength() (every column, plain distance); a solid pack must read 1,
+   an empty one 0. */
+static int packed_check(const sh4dow_packed_t *p, float every, const float q[3]) {
+    const float s = sh4dow_strength_packed(p, q[0], q[1], q[2]);
+
+    if(fabsf(s - every) > packed_worst)
+        packed_worst = fabsf(s - every);
+    if(!near(s, every, SH4DOW_TEST_PACKED_TOL))
+        return fail("packed: strength against every column");
+    if(p->solid && !near(every, 1.0f, SH4DOW_TEST_PACKED_TOL))
+        return fail("packed: a solid ball with a vertex below full strength");
+    if(!p->count && every != 0.0f)
+        return fail("packed: an empty list with a shaded vertex");
+    return 0;
 }
 
 static float ref_smooth(float x, float e0, float e1) {
@@ -257,6 +282,8 @@ static int ball_random(int shrink) {
 
         for(b = 0; b < 40; b++) {
             uint8_t list[SH4DOW_COLUMN_MAX];
+            sh4dow_packed_t pk;
+            float batch_xyz[25][3], batch_one[25], batch_out[25];
             unsigned n, own = (unsigned)(rnd() * 16.0f);
             float c[3], r, pc[3];
 
@@ -270,6 +297,13 @@ static int ball_random(int shrink) {
             n = sh4dow_ball_columns(&f, pc[0], pc[1], pc[2], shrink ? r * 0.5f : r, own, list);
             if(list_order(&f, list, n, own))
                 return 1;
+            if(sh4dow_ball_pack(&f, pc[0], pc[1], pc[2], shrink ? r * 0.5f : r, own, &pk) != n)
+                return fail("ball pack: count");
+            if(!shrink) {
+                packed_balls++;
+                packed_solid += pk.solid;
+                packed_empty += !pk.count;
+            }
             listed += n;
             for(k = 0; k < (int)n; k++)
                 full += (list[k] & SH4DOW_LIST_FULL) != 0;
@@ -279,10 +313,13 @@ static int ball_random(int shrink) {
 
                 rnd_ball(v);
                 for(k = 0; k < 3; k++)
-                    v[k] = c[k] + v[k] * r;
+                    batch_xyz[i][k] = v[k] = c[k] + v[k] * r;
                 sh4dow_project(&f, v[0], v[1], v[2], q);
                 a = sh4dow_strength(&f, &axes, v[0], v[1], v[2], own);
                 d = sh4dow_strength_list(&f, q[0], q[1], q[2], list, n);
+                if(!shrink && packed_check(&pk, a, q))
+                    return 1;
+                batch_one[i] = sh4dow_strength_packed(&pk, q[0], q[1], q[2]);
                 if(!near(a, ref_at(&f, v, own), TOL))
                     return fail("ball: strength against the reference");
                 if(!near(a, d, TOL))
@@ -294,6 +331,12 @@ static int ball_random(int shrink) {
                 for(k = 0; k < f.count; k++)
                     above += vt - f.column[k].t0 > 0.0f;
                 verts++;
+            }
+            if(!shrink) {
+                sh4dow_strength_packed_n(&f, &pk, batch_xyz[0], sizeof batch_xyz[0], batch_out, 25);
+                for(i = 0; i < 25; i++)
+                    if(!near(batch_out[i], pk.solid ? 1.0f : batch_one[i], TOL))
+                        return fail("packed_n: against sh4dow_strength_packed()");
             }
         }
     }
@@ -328,6 +371,7 @@ static int capsule_random(int shrink) {
 
         for(b = 0; b < 40; b++) {
             uint8_t list[SH4DOW_COLUMN_MAX];
+            sh4dow_packed_t pk;
             const unsigned own = (unsigned)(rnd() * 14.0f);
             float c0[3], c1[3], r0, r1, p0[3], p1[3];
             unsigned n;
@@ -345,20 +389,24 @@ static int capsule_random(int shrink) {
             n = sh4dow_capsule_columns(&f, p0, shrink ? r0 * 0.3f : r0, p1, shrink ? r1 * 0.3f : r1, own, list);
             if(list_order(&f, list, n, own))
                 return 1;
+            if(sh4dow_capsule_pack(&f, p0, shrink ? r0 * 0.3f : r0, p1, shrink ? r1 * 0.3f : r1, own, &pk) != n)
+                return fail("capsule pack: count");
             listed += n;
 
             for(i = 0; i < 25; i++) {
                 const float w = rnd();
-                float u0[3], u1[3], v[3], q[3];
+                float u0[3], u1[3], v[3], q[3], a;
 
                 rnd_ball(u0);
                 rnd_ball(u1);
                 for(k = 0; k < 3; k++)
                     v[k] = w * (c0[k] + u0[k] * r0) + (1.0f - w) * (c1[k] + u1[k] * r1);
                 sh4dow_project(&f, v[0], v[1], v[2], q);
-                if(!near(sh4dow_strength(&f, &axes, v[0], v[1], v[2], own),
-                         sh4dow_strength_list(&f, q[0], q[1], q[2], list, n), TOL))
+                a = sh4dow_strength(&f, &axes, v[0], v[1], v[2], own);
+                if(!near(a, sh4dow_strength_list(&f, q[0], q[1], q[2], list, n), TOL))
                     miss++;
+                if(!shrink && packed_check(&pk, a, q))
+                    return 1;
                 verts++;
             }
         }
@@ -371,6 +419,93 @@ static int capsule_random(int shrink) {
         return 1;
     }
     printf("capsule lists: %u blended vertices, listed %.2f a vertex\n", verts, (double)listed * 25.0 / verts);
+    return 0;
+}
+
+/* One fat column straight down: a ball deep in its core packs solid and reads 1 at every point; one that
+   pokes into the feather, or lies past the hold, does not; one off to the side packs empty. */
+static int packed_solid_case(void) {
+    const float down[3] = { 0.0f, 0.0f, -1.0f };
+    sh4dow_limb_t limb = { { 0.0f, 0.0f, 0.0f }, 1.0f, 3, 0 };
+    sh4dow_frame_t f;
+    sh4dow_packed_t pk;
+    float c[3];
+    int i, k;
+
+    if(sh4dow_prepare(&f, NULL, &limb, 1, down) != 1)
+        return fail("solid prepare");
+    sh4dow_project(&f, 0.3f, 0.0f, -0.8f, c);
+    sh4dow_ball_pack(&f, c[0], c[1], c[2], 0.1f, SH4DOW_BONE_NONE, &pk);
+    if(pk.count != 1 || !pk.solid)
+        return fail("solid: a ball deep in the core");
+    for(i = 0; i < 200; i++) {
+        float v[3], q[3];
+
+        rnd_ball(v);
+        sh4dow_project(&f, 0.3f + v[0] * 0.1f, v[1] * 0.1f, -0.8f + v[2] * 0.1f, q);
+        if(sh4dow_strength_packed(&pk, q[0], q[1], q[2]) != 1.0f)
+            return fail("solid: a vertex below 1");
+    }
+    sh4dow_project(&f, 1.2f, 0.0f, -0.8f, c);
+    sh4dow_ball_pack(&f, c[0], c[1], c[2], 0.1f, SH4DOW_BONE_NONE, &pk);
+    if(pk.count != 1 || pk.solid)
+        return fail("solid: a ball across the feather");
+    sh4dow_project(&f, 0.0f, 0.0f, -1.6f, c);
+    sh4dow_ball_pack(&f, c[0], c[1], c[2], 0.1f, SH4DOW_BONE_NONE, &pk);
+    if(pk.count != 1 || pk.solid || pk.full)
+        return fail("solid: a ball in the fade-out");
+    sh4dow_project(&f, 3.0f, 0.0f, -0.8f, c);
+    sh4dow_ball_pack(&f, c[0], c[1], c[2], 0.1f, SH4DOW_BONE_NONE, &pk);
+    if(pk.count || pk.solid)
+        return fail("solid: a ball beside the column");
+    sh4dow_project(&f, 0.0f, 0.0f, -0.8f, c);
+    sh4dow_ball_pack(&f, c[0], c[1], c[2], 0.1f, 3, &pk);
+    if(pk.count || pk.solid)
+        return fail("solid: the column's own bone");
+    for(k = 0; k < 3; k++)
+        c[k] = 0.0f;
+    if(sh4dow_pack(&f, NULL, 0, &pk) || pk.count || sh4dow_ball_pack(NULL, 0.0f, 0.0f, 0.0f, 1.0f, 0, &pk))
+        return fail("pack: NULL");
+    return 0;
+}
+
+/* A pack of all 32 columns: the Dreamcast walk reads its second entry past the last, inside the pack. Against the
+   plain list over the same 32 entries, at points all over the figure. */
+static int pack_full_32(void) {
+    sh4dow_limb_t limb32[SH4DOW_COLUMN_MAX];
+    sh4dow_frame_t f;
+    sh4dow_packed_t pk;
+    uint8_t list[SH4DOW_COLUMN_MAX];
+    float dir[3];
+    int i, k, trial;
+
+    for(trial = 0; trial < 20; trial++) {
+        rnd_limbs(limb32, 14);
+        rnd_limbs(limb32 + 14, 14);
+        rnd_limbs(limb32 + 28, 4);
+        for(i = 0; i < SH4DOW_COLUMN_MAX; i++) {
+            limb32[i].bone = (uint8_t)i;
+            limb32[i].flags = 0;
+        }
+        rnd_light(dir);
+        if(sh4dow_prepare(&f, NULL, limb32, SH4DOW_COLUMN_MAX, dir) != SH4DOW_COLUMN_MAX)
+            return fail("32 prepare");
+        for(i = 0; i < SH4DOW_COLUMN_MAX; i++)
+            list[i] = (uint8_t)i;
+        if(sh4dow_pack(&f, list, SH4DOW_COLUMN_MAX, &pk) != SH4DOW_COLUMN_MAX || pk.full)
+            return fail("32 pack");
+        for(i = 0; i < 400; i++) {
+            float v[3], q[3];
+
+            for(k = 0; k < 3; k++)
+                v[k] = (rnd() - 0.5f) * 0.8f;
+            v[2] += 0.35f;
+            sh4dow_project(&f, v[0], v[1], v[2], q);
+            if(!near(sh4dow_strength_packed(&pk, q[0], q[1], q[2]),
+                     sh4dow_strength_list(&f, q[0], q[1], q[2], list, SH4DOW_COLUMN_MAX), TOL))
+                return fail("32 pack: against the list");
+        }
+    }
     return 0;
 }
 
@@ -499,8 +634,11 @@ int main(void) {
     sh4dow_frame_t f;
 
     if(single(&f) || params(&f) || sorted_random() ||
-       ball_random(0) || ball_random(1) || capsule_random(0) || capsule_random(1) || direction() || projection())
+       ball_random(0) || ball_random(1) || capsule_random(0) || capsule_random(1) || direction() || projection() ||
+       packed_solid_case() || pack_full_32())
         return 1;
+    printf("packed lists: within %.1e of every column; %u of %u random balls solid, %u empty\n",
+           (double)packed_worst, packed_solid, packed_balls, packed_empty);
     printf("ok\n");
     return 0;
 }

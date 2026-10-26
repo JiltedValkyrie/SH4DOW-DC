@@ -54,6 +54,14 @@ static float smooth(float x, float e0, float e1) {
 
 static v3_t v3_of(const float p[3]) { return v3(p[0], p[1], p[2]); }
 
+/* A bit test: under -ffast-math a float compare against NaN folds away. */
+static int is_finite(float x) {
+    union { float f; uint32_t u; } v;
+
+    v.f = x;
+    return (v.u & 0x7f800000u) != 0x7f800000u;
+}
+
 /* Smaller than this is "no horizontal part": a light straight overhead, a facing straight up. */
 #define FLAT_EPS 1.0e-4f
 
@@ -177,7 +185,7 @@ float sh4dow_foot_range_fade(const sh4dow_foot_params_t *params, float dist, flo
     }
     z = zoom > 1.0f ? zoom : 1.0f;
     end = params->range * z;
-    if(!(dist < end))
+    if(!is_finite(dist) || !(dist < end))
         return 0.0f;
     return 1.0f - smooth(dist, end - params->range_fade * z, end);
 }
